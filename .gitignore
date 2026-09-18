@@ -1,0 +1,8 @@
+.venv
+.aim
+checkpoints
+data
+latest_samples.log
+.DS_Store
+.idea
+__pycache__
