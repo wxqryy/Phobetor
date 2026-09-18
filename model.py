@@ -1,162 +1,236 @@
 import math
+
 import mlx.core as mx
 import mlx.nn as nn
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-5):
-        super().__init__()
-        self.weight = mx.ones((dims,))
-        self.eps = eps
-
-    def __call__(self, x):
-        variance = mx.mean(mx.square(x), axis=-1, keepdims=True)
-        return x * mx.rsqrt(variance + self.eps) * self.weight
-
-
-class EulerRoPE(nn.Module):
-    def __init__(self, dims: int, max_seq_len: int = 2048, theta: float = 10000.0):
-        super().__init__()
-        self.dims = dims
-        freqs = 1.0 / (theta ** (mx.arange(0, dims, 2).astype(mx.float32) / dims))
-        t = mx.arange(max_seq_len).astype(mx.float32)
-        angles = mx.outer(t, freqs)
-        self.cos = mx.cos(angles)
-        self.sin = mx.sin(angles)
-
-    def __call__(self, x, offset: int = 0):
-        seq_len = x.shape[1]
-        cos = self.cos[offset : offset + seq_len][:, None, :]
-        sin = self.sin[offset : offset + seq_len][:, None, :]
-
-        x1 = x[..., 0::2]
-        x2 = x[..., 1::2]
-        rotated_real = x1 * cos - x2 * sin
-        rotated_imag = x1 * sin + x2 * cos
-        out = mx.stack([rotated_real, rotated_imag], axis=-1)
-        return mx.reshape(out, x.shape)
-
-
-class BidirectionalAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int):
-        super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        self.rope = EulerRoPE(self.head_dim)
-
-    def __call__(self, x):
-        B, L, _ = x.shape
-        q = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
-        k = self.k_proj(x).reshape(B, L, self.n_heads, self.head_dim)
-        v = self.v_proj(x).reshape(B, L, self.n_heads, self.head_dim)
-
-        q = self.rope(q)
-        k = self.rope(k)
-
-        q = q.transpose(0, 2, 1, 3)
-        k = k.transpose(0, 2, 1, 3)
-        v = v.transpose(0, 2, 1, 3)
-
-        scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale
-        probs = mx.softmax(scores, axis=-1)
-        output = probs @ v
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, self.d_model)
-        return self.out_proj(output)
-
-
-class BiMambaBlock(nn.Module):
-    def __init__(self, d_model: int, d_state: int = 16, max_seq_len: int = 1024):
-        super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-
-        self.in_proj = nn.Linear(d_model, d_model * 2, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
-
-        self.A_log = mx.log(mx.arange(1, d_state + 1, dtype=mx.float32))
-        self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1)
-
-    def __call__(self, x):
-        B, L, D = x.shape
-        proj = self.in_proj(x)
-        u, gate = proj[..., :D], proj[..., D:]
-        gate = nn.silu(gate)
-        u_conv = nn.silu(self.conv(u))
-
-        u_s = u_conv[..., :self.d_state]
-
-        decay = mx.exp(-mx.exp(self.A_log))
-
-        idx = mx.arange(L)
-        diff = idx[:, None] - idx[None, :]
-        mask = diff >= 0
-        diff_clamped = mx.maximum(diff, 0)
-
-        decay_exp = decay[:, None, None] ** diff_clamped[None, :, :]
-        M_fwd = mx.where(mask[None, :, :], decay_exp, 0.0)
-        M_bwd = M_fwd.transpose(0, 2, 1)
-
-        u_vec = u_s.transpose(0, 2, 1)[..., None]
-
-        out_fwd = (M_fwd[None, ...] @ u_vec).squeeze(-1).transpose(0, 2, 1)
-        out_bwd = (M_bwd[None, ...] @ u_vec).squeeze(-1).transpose(0, 2, 1)
-
-        fused = (out_fwd + out_bwd) * gate[..., :self.d_state]
-        expanded = mx.concatenate([fused, u_conv[..., self.d_state:]], axis=-1)
-        return self.out_proj(expanded)
+from mlx_recurrence import ssd_scan
 
 
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, d_ff: int):
         super().__init__()
-        self.w1 = nn.Linear(d_model, d_ff, bias=False)
-        self.w2 = nn.Linear(d_ff, d_model, bias=False)
-        self.w3 = nn.Linear(d_model, d_ff, bias=False)
+        self.gate_proj = nn.Linear(d_model, d_ff, bias=False)
+        self.up_proj = nn.Linear(d_model, d_ff, bias=False)
+        self.down_proj = nn.Linear(d_ff, d_model, bias=False)
 
     def __call__(self, x):
-        return self.w2(nn.silu(self.w1(x)) * self.w3(x))
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class HybridPhobetorBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int):
+class BidirectionalAttention(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, rope_base: float = 10000.0):
         super().__init__()
-        self.norm1 = RMSNorm(d_model)
-        self.mamba = BiMambaBlock(d_model)
-        self.norm2 = RMSNorm(d_model)
-        self.attn = BidirectionalAttention(d_model, n_heads)
-        self.norm3 = RMSNorm(d_model)
+        if d_model % n_heads != 0:
+            raise ValueError("d_model must be divisible by n_heads")
+
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
+
+    def __call__(self, x):
+        B, L, _ = x.shape
+        q = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.k_proj(x).reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.v_proj(x).reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+        q = self.rope(q)
+        k = self.rope(k)
+
+        y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        y = y.transpose(0, 2, 1, 3).reshape(B, L, self.d_model)
+        return self.out_proj(y)
+
+
+class Mamba2Core(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        expand: float = 2.0,
+        d_state: int = 64,
+        head_dim: int = 64,
+        d_conv: int = 4,
+        dt_min: float = 1e-3,
+        dt_max: float = 1e-1,
+        a_min: float = 1.0,
+        a_max: float = 16.0,
+    ):
+        super().__init__()
+
+        self.d_model = d_model
+        self.d_inner = int(d_model * expand)
+        self.d_state = d_state
+        self.head_dim = head_dim
+        self.d_conv = d_conv
+
+        if self.d_inner % head_dim != 0:
+            raise ValueError("d_model * expand must be divisible by head_dim")
+        if head_dim % 32 != 0:
+            raise ValueError("mlx-recurrence requires head_dim to be divisible by 32")
+
+        self.n_heads = self.d_inner // head_dim
+        self.bc_dim = d_state
+        self.conv_dim = self.d_inner + 2 * self.bc_dim
+        self.proj_dim = 2 * self.d_inner + 2 * self.bc_dim + self.n_heads
+
+        self.in_proj = nn.Linear(d_model, self.proj_dim, bias=False)
+        self.conv = nn.Conv1d(
+            self.conv_dim,
+            self.conv_dim,
+            kernel_size=d_conv,
+            padding=d_conv - 1,
+            groups=self.conv_dim,
+            bias=True,
+        )
+
+        a = mx.random.uniform(low=a_min, high=a_max, shape=(self.n_heads,)).astype(mx.float32)
+        self.A_log = mx.log(a)
+
+        log_dt = mx.random.uniform(
+            low=math.log(dt_min),
+            high=math.log(dt_max),
+            shape=(self.n_heads,),
+        )
+        dt = mx.exp(log_dt)
+        self.dt_bias = dt + mx.log(-mx.expm1(-dt))
+        self.D = mx.ones((self.n_heads,), dtype=mx.float32)
+
+        self.norm = nn.RMSNorm(self.d_inner, eps=1e-5)
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+
+    def __call__(self, x):
+        B, L, _ = x.shape
+        if L % 32 != 0:
+            raise ValueError("mlx-recurrence ssd_scan requires sequence length divisible by 32")
+
+        projected = self.in_proj(x)
+        z = projected[..., :self.d_inner]
+        xbc_start = self.d_inner
+        xbc_end = xbc_start + self.conv_dim
+        xbc = projected[..., xbc_start:xbc_end]
+        dt_raw = projected[..., xbc_end:]
+
+        xbc = nn.silu(self.conv(xbc)[:, :L, :])
+        u = xbc[..., :self.d_inner]
+        B_shared = xbc[..., self.d_inner:self.d_inner + self.d_state]
+        C_shared = xbc[..., self.d_inner + self.d_state:]
+
+        u = u.reshape(B, L, self.n_heads, self.head_dim)
+        B_in = mx.contiguous(mx.broadcast_to(B_shared[:, :, None, :], (B, L, self.n_heads, self.d_state)))
+        C_in = mx.contiguous(mx.broadcast_to(C_shared[:, :, None, :], (B, L, self.n_heads, self.d_state)))
+
+        delta = nn.softplus(dt_raw + self.dt_bias)
+        A_neg = mx.contiguous(
+            mx.broadcast_to(-mx.exp(self.A_log)[:, None], (self.n_heads, self.d_state))
+        )
+
+        y = ssd_scan(u, delta, B_in, C_in, A_neg)
+        y = y + u * self.D[None, None, :, None]
+        y = y.reshape(B, L, self.d_inner)
+        y = self.norm(y * nn.silu(z))
+        return self.out_proj(y)
+
+
+class BidirectionalMamba2(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        expand: float = 2.0,
+        d_state: int = 64,
+        head_dim: int = 64,
+        d_conv: int = 4,
+    ):
+        super().__init__()
+        self.forward_core = Mamba2Core(d_model, expand, d_state, head_dim, d_conv)
+        self.backward_core = Mamba2Core(d_model, expand, d_state, head_dim, d_conv)
+        self.fuse = nn.Linear(d_model * 2, d_model, bias=False)
+
+    def __call__(self, x):
+        forward = self.forward_core(x)
+        reversed_x = mx.flip(x, axis=1)
+        backward = mx.flip(self.backward_core(reversed_x), axis=1)
+        return self.fuse(mx.concatenate([forward, backward], axis=-1))
+
+
+class PhobetorLayer(nn.Module):
+    def __init__(
+        self,
+        mixer: str,
+        d_model: int,
+        n_heads: int,
+        d_ff: int,
+        mamba_expand: float,
+        d_state: int,
+        mamba_head_dim: int,
+        d_conv: int,
+    ):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(d_model, eps=1e-5)
+        self.norm2 = nn.RMSNorm(d_model, eps=1e-5)
+
+        if mixer == "mamba":
+            self.mixer = BidirectionalMamba2(
+                d_model=d_model,
+                expand=mamba_expand,
+                d_state=d_state,
+                head_dim=mamba_head_dim,
+                d_conv=d_conv,
+            )
+        elif mixer == "attention":
+            self.mixer = BidirectionalAttention(d_model, n_heads)
+        else:
+            raise ValueError(f"Unknown mixer type: {mixer}")
+
         self.mlp = SwiGLU(d_model, d_ff)
 
     def __call__(self, x):
-        x = x + self.mamba(self.norm1(x))
-        x = x + self.attn(self.norm2(x))
-        x = x + self.mlp(self.norm3(x))
+        x = x + self.mixer(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
 class PhobetorModel(nn.Module):
-    def __init__(self, vocab_size: int = 152064, d_model: int = 1024, n_layers: int = 8, n_heads: int = 16, d_ff: int = 2816):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 1024,
+        n_heads: int = 16,
+        d_ff: int = 3072,
+        layer_pattern=("mamba", "mamba", "mamba", "attention") * 3,
+        mamba_expand: float = 2.0,
+        d_state: int = 64,
+        mamba_head_dim: int = 64,
+        d_conv: int = 4,
+    ):
         super().__init__()
         self.d_model = d_model
+        self.vocab_size = vocab_size
+        self.layer_pattern = tuple(layer_pattern)
+
         self.embed = nn.Embedding(vocab_size, d_model)
-        self.layers = [HybridPhobetorBlock(d_model, n_heads, d_ff) for _ in range(n_layers)]
-        self.norm_f = RMSNorm(d_model)
+        self.layers = [
+            PhobetorLayer(
+                mixer=mixer,
+                d_model=d_model,
+                n_heads=n_heads,
+                d_ff=d_ff,
+                mamba_expand=mamba_expand,
+                d_state=d_state,
+                mamba_head_dim=mamba_head_dim,
+                d_conv=d_conv,
+            )
+            for mixer in self.layer_pattern
+        ]
+        self.norm_f = nn.RMSNorm(d_model, eps=1e-5)
 
-    def __call__(self, x):
-        h = self.embed(x)
-
+    def __call__(self, tokens):
+        h = self.embed(tokens)
         for layer in self.layers:
             h = layer(h)
-        for layer in self.layers:
-            h = layer(h)
-
         h = self.norm_f(h)
-        logits = h @ self.embed.weight.T
-        return logits
+        return h @ self.embed.weight.T

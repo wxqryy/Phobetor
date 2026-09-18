@@ -6,3 +6,5 @@ latest_samples.log
 .DS_Store
 .idea
 __pycache__
+v1
+smoke_test.py

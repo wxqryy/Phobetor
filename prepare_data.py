@@ -1,91 +1,164 @@
+import json
 import os
 import time
-import json
+
 import numpy as np
-from datasets import load_dataset
+from datasets import interleave_datasets, load_dataset
 from transformers import AutoTokenizer
 
-DATA_BIN_PATH = "./data/train_tokens.bin"
 TOKENIZER_DIR = "./tokenizer"
-STATE_FILE = "./data/prepare_state.json"
-TARGET_TOKENS = 2_000_000_000
-BUFFER_FLUSH_SIZE = 2_000_000
+TRAIN_PATH = "./data/train_tokens.bin"
+VAL_PATH = "./data/val_tokens.bin"
+STATE_PATH = "./data/prepare_state.json"
 
-if not os.path.exists(os.path.join(TOKENIZER_DIR, "tokenizer.json")):
-    print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
-    if tokenizer.mask_token is None:
-        tokenizer.add_special_tokens({"mask_token": "[MASK]"})
-    tokenizer.save_pretrained(TOKENIZER_DIR)
-    print(f"Tokenizer has been saved!")
-else:
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
+TRAIN_TARGET = 2_000_000_000
+VAL_TARGET = 10_000_000
+FLUSH_TOKENS = 2_000_000
+VAL_EVERY_N_DOCS = 200
+SEED = 1337
+DTYPE = np.uint16
 
-tokens_written = 0
-skip_docs = 0
-if os.path.exists(DATA_BIN_PATH):
-    file_bytes = os.path.getsize(DATA_BIN_PATH)
-    tokens_written = file_bytes // 4
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            skip_docs = json.load(f).get("processed_docs", 0)
-    print(f"Prepared {tokens_written / 1e6:.2f}M tokens. Proceeding...")
 
-if tokens_written >= TARGET_TOKENS:
-    print(f"Complete dataset ({tokens_written:,} tokens).")
-    exit(0)
+def make_stream():
+    finemath = load_dataset(
+        "HuggingFaceTB/finemath",
+        "finemath-4plus",
+        split="train",
+        streaming=True,
+    )
+    textbooks = load_dataset(
+        "Locutusque/UltraTextbooks-2.0",
+        split="train",
+        streaming=True,
+    )
+    textbooks = textbooks.filter(
+        lambda row: row.get("source") != "nampdn-ai/tiny-strange-textbooks"
+    )
+    return interleave_datasets(
+        [finemath, textbooks],
+        probabilities=[0.60, 0.40],
+        seed=SEED,
+        stopping_strategy="all_exhausted",
+    )
 
-print("Start loading dataset")
-dataset = load_dataset("Locutusque/UltraTextbooks", split="train", streaming=True)
 
-buffer = []
-docs_count = 0
-
-def save_buffer_to_disk(buf, count):
-    if not buf:
+def disk_tokens(path):
+    if not os.path.exists(path):
         return 0
-    arr = np.array(buf, dtype=np.uint32)
-    with open(DATA_BIN_PATH, "ab") as f:
+    return os.path.getsize(path) // np.dtype(DTYPE).itemsize
+
+
+def append_tokens(path, values):
+    if not values:
+        return 0
+    arr = np.asarray(values, dtype=DTYPE)
+    with open(path, "ab") as f:
         f.write(arr.tobytes())
-    with open(STATE_FILE, "w") as f:
-        json.dump({"processed_docs": count}, f)
-    return len(buf)
+    return len(arr)
 
-while tokens_written < TARGET_TOKENS:
+
+def save_state(processed_docs, train_written, val_written):
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "processed_docs": processed_docs,
+                "train_tokens": train_written,
+                "val_tokens": val_written,
+            },
+            f,
+        )
+
+
+os.makedirs("./data", exist_ok=True)
+tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
+
+if len(tokenizer) > np.iinfo(DTYPE).max + 1:
+    raise RuntimeError("Tokenizer is too large for uint16 storage")
+if tokenizer.eos_token_id is None or tokenizer.mask_token_id is None:
+    raise RuntimeError("Tokenizer must define EOS and MASK tokens")
+
+train_written = disk_tokens(TRAIN_PATH)
+val_written = disk_tokens(VAL_PATH)
+processed_docs = 0
+
+if os.path.exists(STATE_PATH):
+    with open(STATE_PATH, "r", encoding="utf-8") as f:
+        state = json.load(f)
+    processed_docs = int(state.get("processed_docs", 0))
+
+print(f"Existing train: {train_written / 1e6:.2f}M tokens")
+print(f"Existing val:   {val_written / 1e6:.2f}M tokens")
+print(f"Resume after:   {processed_docs:,} streamed rows")
+
+train_buffer = []
+val_buffer = []
+
+
+def flush():
+    global train_written, val_written
+    train_remaining = max(TRAIN_TARGET - train_written, 0)
+    val_remaining = max(VAL_TARGET - val_written, 0)
+
+    if train_buffer and train_remaining:
+        chunk = train_buffer[:train_remaining]
+        train_written += append_tokens(TRAIN_PATH, chunk)
+    if val_buffer and val_remaining:
+        chunk = val_buffer[:val_remaining]
+        val_written += append_tokens(VAL_PATH, chunk)
+
+    train_buffer.clear()
+    val_buffer.clear()
+    save_state(processed_docs, train_written, val_written)
+
+
+while train_written < TRAIN_TARGET or val_written < VAL_TARGET:
     try:
-        for row in dataset:
-            docs_count += 1
-            if docs_count <= skip_docs:
-                continue
+        stream = make_stream()
+        if processed_docs:
+            stream = stream.skip(processed_docs)
 
+        for row in stream:
+            processed_docs += 1
             text = row.get("text", "")
-            if not text or len(text.strip()) < 50:
+            if not text or len(text.strip()) < 100:
                 continue
 
-            tokens = tokenizer.encode(text)
-            tokens.append(tokenizer.eos_token_id)
-            buffer.extend(tokens)
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            ids.append(tokenizer.eos_token_id)
 
-            if len(buffer) >= BUFFER_FLUSH_SIZE:
-                written = save_buffer_to_disk(buffer, docs_count)
-                tokens_written += written
-                buffer.clear()
-                print(f"Done: {tokens_written / 1e6:.2f}M / {TARGET_TOKENS / 1e6:.0f}M tokens. "
-                      f"({(tokens_written / TARGET_TOKENS) * 100:.1f}%) | Files: {docs_count:,}")
+            if processed_docs % VAL_EVERY_N_DOCS == 0 and val_written + len(val_buffer) < VAL_TARGET:
+                val_buffer.extend(ids)
+            elif train_written + len(train_buffer) < TRAIN_TARGET:
+                train_buffer.extend(ids)
 
-            if tokens_written >= TARGET_TOKENS:
+            targets_buffered = (
+                    train_written + len(train_buffer) >= TRAIN_TARGET
+                    and val_written + len(val_buffer) >= VAL_TARGET
+            )
+
+            if len(train_buffer) + len(val_buffer) >= FLUSH_TOKENS or targets_buffered:
+                flush()
+
+                print(
+                    f"Train {train_written / 1e9:.3f}B/{TRAIN_TARGET / 1e9:.1f}B | "
+                    f"Val {val_written / 1e6:.2f}M/{VAL_TARGET / 1e6:.0f}M | "
+                    f"Rows {processed_docs:,}"
+                )
+
+            if train_written >= TRAIN_TARGET and val_written >= VAL_TARGET:
                 break
 
+        flush()
+        if train_written >= TRAIN_TARGET and val_written >= VAL_TARGET:
+            break
+        raise RuntimeError("Dataset stream ended before token targets were reached")
+
+    except KeyboardInterrupt:
+        flush()
+        raise
     except Exception as e:
-        print(f"\n⚠️ Internet issue: {e}")
-        written = save_buffer_to_disk(buffer, docs_count)
-        tokens_written += written
-        buffer.clear()
+        print(f"Data stream error: {e}")
+        flush()
         time.sleep(5)
-        dataset = load_dataset("Locutusque/UltraTextbooks", split="train", streaming=True)
-        skip_docs = docs_count
 
-if buffer:
-    tokens_written += save_buffer_to_disk(buffer, docs_count)
-
-print(f"\nSuccess! {tokens_written:,} tokens saved to {DATA_BIN_PATH}.")
+print(f"Done. Train: {train_written:,} tokens, val: {val_written:,} tokens")
