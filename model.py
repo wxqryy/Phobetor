@@ -41,7 +41,6 @@ class BidirectionalAttention(nn.Module):
 
         q = self.rope(q)
         k = self.rope(k)
-
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
         y = y.transpose(0, 2, 1, 3).reshape(B, L, self.d_model)
         return self.out_proj(y)
@@ -61,7 +60,6 @@ class Mamba2Core(nn.Module):
         a_max: float = 16.0,
     ):
         super().__init__()
-
         self.d_model = d_model
         self.d_inner = int(d_model * expand)
         self.d_state = d_state
@@ -90,12 +88,7 @@ class Mamba2Core(nn.Module):
 
         a = mx.random.uniform(low=a_min, high=a_max, shape=(self.n_heads,)).astype(mx.float32)
         self.A_log = mx.log(a)
-
-        log_dt = mx.random.uniform(
-            low=math.log(dt_min),
-            high=math.log(dt_max),
-            shape=(self.n_heads,),
-        )
+        log_dt = mx.random.uniform(low=math.log(dt_min), high=math.log(dt_max), shape=(self.n_heads,))
         dt = mx.exp(log_dt)
         self.dt_bias = dt + mx.log(-mx.expm1(-dt))
         self.D = mx.ones((self.n_heads,), dtype=mx.float32)
@@ -105,8 +98,15 @@ class Mamba2Core(nn.Module):
 
     def __call__(self, x):
         B, L, _ = x.shape
-        if L % 32 != 0:
-            raise ValueError("mlx-recurrence ssd_scan requires sequence length divisible by 32")
+        original_L = L
+
+        pad_len = (-L) % 32
+        if pad_len:
+            x = mx.concatenate(
+                [x, mx.zeros((B, pad_len, self.d_model), dtype=x.dtype)],
+                axis=1,
+            )
+            L = x.shape[1]
 
         projected = self.in_proj(x)
         z = projected[..., :self.d_inner]
@@ -125,26 +125,18 @@ class Mamba2Core(nn.Module):
         C_in = mx.contiguous(mx.broadcast_to(C_shared[:, :, None, :], (B, L, self.n_heads, self.d_state)))
 
         delta = nn.softplus(dt_raw + self.dt_bias)
-        A_neg = mx.contiguous(
-            mx.broadcast_to(-mx.exp(self.A_log)[:, None], (self.n_heads, self.d_state))
-        )
+        A_neg = mx.contiguous(mx.broadcast_to(-mx.exp(self.A_log)[:, None], (self.n_heads, self.d_state)))
 
         y = ssd_scan(u, delta, B_in, C_in, A_neg)
         y = y + u * self.D[None, None, :, None]
         y = y.reshape(B, L, self.d_inner)
         y = self.norm(y * nn.silu(z))
-        return self.out_proj(y)
+        y = self.out_proj(y)
+        return y[:, :original_L, :]
 
 
 class BidirectionalMamba2(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        expand: float = 2.0,
-        d_state: int = 64,
-        head_dim: int = 64,
-        d_conv: int = 4,
-    ):
+    def __init__(self, d_model: int, expand: float = 2.0, d_state: int = 64, head_dim: int = 64, d_conv: int = 4):
         super().__init__()
         self.forward_core = Mamba2Core(d_model, expand, d_state, head_dim, d_conv)
         self.backward_core = Mamba2Core(d_model, expand, d_state, head_dim, d_conv)
@@ -158,29 +150,13 @@ class BidirectionalMamba2(nn.Module):
 
 
 class PhobetorLayer(nn.Module):
-    def __init__(
-        self,
-        mixer: str,
-        d_model: int,
-        n_heads: int,
-        d_ff: int,
-        mamba_expand: float,
-        d_state: int,
-        mamba_head_dim: int,
-        d_conv: int,
-    ):
+    def __init__(self, mixer: str, d_model: int, n_heads: int, d_ff: int, mamba_expand: float, d_state: int, mamba_head_dim: int, d_conv: int):
         super().__init__()
         self.norm1 = nn.RMSNorm(d_model, eps=1e-5)
         self.norm2 = nn.RMSNorm(d_model, eps=1e-5)
 
         if mixer == "mamba":
-            self.mixer = BidirectionalMamba2(
-                d_model=d_model,
-                expand=mamba_expand,
-                d_state=d_state,
-                head_dim=mamba_head_dim,
-                d_conv=d_conv,
-            )
+            self.mixer = BidirectionalMamba2(d_model, mamba_expand, d_state, mamba_head_dim, d_conv)
         elif mixer == "attention":
             self.mixer = BidirectionalAttention(d_model, n_heads)
         else:
@@ -228,9 +204,12 @@ class PhobetorModel(nn.Module):
         ]
         self.norm_f = nn.RMSNorm(d_model, eps=1e-5)
 
-    def __call__(self, tokens):
+    def __call__(self, tokens, output_start=None, output_end=None):
         h = self.embed(tokens)
         for layer in self.layers:
             h = layer(h)
         h = self.norm_f(h)
+
+        if output_start is not None or output_end is not None:
+            h = h[:, output_start:output_end, :]
         return h @ self.embed.weight.T

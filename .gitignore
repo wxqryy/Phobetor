@@ -8,3 +8,4 @@ latest_samples.log
 __pycache__
 v1
 smoke_test.py
+tests
