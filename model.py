@@ -2,6 +2,7 @@ import math
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.utils import checkpoint
 from mlx_recurrence import ssd_scan
 
 
@@ -149,24 +150,21 @@ class BidirectionalMamba2(nn.Module):
         return self.fuse(mx.concatenate([forward, backward], axis=-1))
 
 
-class PhobetorLayer(nn.Module):
-    def __init__(self, mixer: str, d_model: int, n_heads: int, d_ff: int, mamba_expand: float, d_state: int, mamba_head_dim: int, d_conv: int):
+class HybridPhobetorBlock(nn.Module):
+    """One V1-style hybrid block, with an actual selective Mamba-2 SSM."""
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, mamba_expand: float, d_state: int, mamba_head_dim: int, d_conv: int):
         super().__init__()
         self.norm1 = nn.RMSNorm(d_model, eps=1e-5)
         self.norm2 = nn.RMSNorm(d_model, eps=1e-5)
-
-        if mixer == "mamba":
-            self.mixer = BidirectionalMamba2(d_model, mamba_expand, d_state, mamba_head_dim, d_conv)
-        elif mixer == "attention":
-            self.mixer = BidirectionalAttention(d_model, n_heads)
-        else:
-            raise ValueError(f"Unknown mixer type: {mixer}")
-
+        self.norm3 = nn.RMSNorm(d_model, eps=1e-5)
+        self.mamba = BidirectionalMamba2(d_model, mamba_expand, d_state, mamba_head_dim, d_conv)
+        self.attn = BidirectionalAttention(d_model, n_heads)
         self.mlp = SwiGLU(d_model, d_ff)
 
     def __call__(self, x):
-        x = x + self.mixer(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.mamba(self.norm1(x))
+        x = x + self.attn(self.norm2(x))
+        x = x + self.mlp(self.norm3(x))
         return x
 
 
@@ -177,7 +175,9 @@ class PhobetorModel(nn.Module):
         d_model: int = 1024,
         n_heads: int = 16,
         d_ff: int = 3072,
-        layer_pattern=("mamba", "mamba", "mamba", "attention") * 3,
+        n_layers: int = 8,
+        recurrent_passes: int = 2,
+        gradient_checkpointing: bool = True,
         mamba_expand: float = 2.0,
         d_state: int = 64,
         mamba_head_dim: int = 64,
@@ -186,12 +186,14 @@ class PhobetorModel(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
-        self.layer_pattern = tuple(layer_pattern)
+        if n_layers < 1 or recurrent_passes < 1:
+            raise ValueError("n_layers and recurrent_passes must be positive")
+        self.recurrent_passes = recurrent_passes
+        self.gradient_checkpointing = gradient_checkpointing
 
         self.embed = nn.Embedding(vocab_size, d_model)
         self.layers = [
-            PhobetorLayer(
-                mixer=mixer,
+            HybridPhobetorBlock(
                 d_model=d_model,
                 n_heads=n_heads,
                 d_ff=d_ff,
@@ -200,14 +202,16 @@ class PhobetorModel(nn.Module):
                 mamba_head_dim=mamba_head_dim,
                 d_conv=d_conv,
             )
-            for mixer in self.layer_pattern
+            for _ in range(n_layers)
         ]
         self.norm_f = nn.RMSNorm(d_model, eps=1e-5)
 
     def __call__(self, tokens, output_start=None, output_end=None):
         h = self.embed(tokens)
-        for layer in self.layers:
-            h = layer(h)
+
+        for _ in range(self.recurrent_passes):
+            for layer in self.layers:
+                h = checkpoint(layer)(h) if self.training and self.gradient_checkpointing else layer(h)
         h = self.norm_f(h)
 
         if output_start is not None or output_end is not None:

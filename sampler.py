@@ -7,12 +7,12 @@ import mlx.core as mx
 @dataclass(frozen=True)
 class SamplerConfig:
     context_window: int = 1024
-    block_size: int = 64
-    overlap: int = 16
-    refinement_steps: int = 32
-    temperature: float = 0.0
+    block_size: int = 32
+    overlap: int = 24
+    refinement_steps: int = 16
+    temperature: float = 0.8
 
-    audit_every: int = 8
+    audit_every: int = 0
     audit_start_fraction: float = 0.25
     audit_end_fraction: float = 0.75
     audit_candidates: int = 32
@@ -21,7 +21,7 @@ class SamplerConfig:
     audit_replacement_conf: float = 0.30
     audit_position_budget: int = 2
 
-    final_polish_rounds: int = 2
+    final_polish_rounds: int = 0
 
     def validate(self):
         if self.context_window <= 0:
@@ -281,9 +281,7 @@ class PhobetorSampler:
         cfg = self.config
         active = mx.array([initial_active], dtype=mx.int32)
         confidence = mx.array([initial_confidence], dtype=mx.float32)
-        initial_mask_count = sum(token == self.mask_id for token in initial_active)
-        if initial_mask_count <= 0:
-            initial_mask_count = cfg.stride
+        initial_mask_count = cfg.block_size
 
         key = mx.random.key(self.seed + seed_offset)
         audit_counts = [0] * cfg.block_size

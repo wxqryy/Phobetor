@@ -103,24 +103,29 @@ def inspect_checkpoint(path):
     return metrics
 
 
-def restore_latest(directory, model, optimizer, model_config, vocab_size):
+def restore_checkpoint(path, model, optimizer, model_config, vocab_size):
     expected_config = json.loads(json.dumps(model_config))
+    path = Path(path)
+    metrics = inspect_checkpoint(path)
+    if metrics.get("model_config") != expected_config or metrics.get("vocab_size") != vocab_size:
+        raise ValueError("Model configuration or vocabulary does not match")
+    model.load_weights(str(path / "model.safetensors"))
+    optimizer.state = tree_unflatten(mx.load(str(path / "optimizer.safetensors")))
+    mx.eval(model.parameters(), optimizer.state)
+    require_finite(model.parameters(), "checkpoint weights")
+    require_finite(optimizer.state, "checkpoint optimizer state")
+    print(f"Resuming complete checkpoint: {path}")
+    return TrainingProgress(metrics["step"], metrics["tokens_seen"], metrics["train_loss"]), metrics
+
+
+def restore_latest(directory, model, optimizer, model_config, vocab_size):
     paths = checkpoint_paths(directory)
     for path in paths:
         try:
-            metrics = inspect_checkpoint(path)
-            if metrics.get("model_config") != expected_config or metrics.get("vocab_size") != vocab_size:
-                raise ValueError("Model configuration or vocabulary does not match")
-            model.load_weights(str(path / "model.safetensors"))
-            optimizer.state = tree_unflatten(mx.load(str(path / "optimizer.safetensors")))
-            mx.eval(model.parameters(), optimizer.state)
-            require_finite(model.parameters(), "checkpoint weights")
-            require_finite(optimizer.state, "checkpoint optimizer state")
+            return restore_checkpoint(path, model, optimizer, model_config, vocab_size)
         except (ValueError, KeyError, TypeError, OSError, RuntimeError, FloatingPointError, SafetensorError) as exc:
             print(f"Skipping checkpoint {path.name}: {exc}")
             continue
-        print(f"Resuming complete checkpoint: {path}")
-        return TrainingProgress(metrics["step"], metrics["tokens_seen"], metrics["train_loss"]), metrics
     if paths:
         raise RuntimeError("No valid resumable checkpoint found; existing files were preserved")
     return TrainingProgress(), {}

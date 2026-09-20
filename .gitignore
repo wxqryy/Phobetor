@@ -7,5 +7,7 @@ latest_samples.log
 .idea
 __pycache__
 v1
-smoke_test.py
 tests
+experiments
+v2
+README.md
