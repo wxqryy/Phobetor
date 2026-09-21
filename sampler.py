@@ -12,9 +12,9 @@ class SamplerConfig:
     refinement_steps: int = 16
     temperature: float = 0.8
 
-    audit_every: int = 0
-    audit_start_fraction: float = 0.25
-    audit_end_fraction: float = 0.75
+    audit_every: int = 1
+    audit_start_fraction: float = 0.0
+    audit_end_fraction: float = 1.0
     audit_candidates: int = 32
     audit_remask_k: int = 1
     audit_current_prob_threshold: float = 0.20
@@ -70,7 +70,7 @@ class PhobetorSampler:
       * predict all masked positions in parallel;
       * progressively keep more tokens;
       * already-filled tokens can be Token-to-Mask remasked;
-      * periodic context audits catch stale/confidently-wrong tokens;
+      * masked context audits refresh old-token confidence before remasking;
       * the last overlap tokens remain editable in the next block.
     """
 
@@ -175,23 +175,39 @@ class PhobetorSampler:
     ):
         cfg = self.config
         m = min(cfg.audit_candidates, cfg.block_size)
-        available = [i for i in range(cfg.block_size) if audit_counts[i] < cfg.audit_position_budget]
+        # A limit on forced replacements must not disable confidence updates.
+        available = list(range(cfg.block_size))
         groups = max(1, math.ceil(cfg.block_size / m))
         candidates = sorted(available, key=lambda i: (audit_visits[i], i % groups, i))[:m]
         if not candidates:
             return confidence, []
 
-        probe_tokens = active[0].tolist()
-        for pos in candidates:
-            probe_tokens[pos] = self.mask_id
-
-        probe_logits = self._active_logits(
-            locked_prefix, probe_tokens, generated_offset, min_new_tokens,
-        )
-        current_logp = self._gather_token_log_probs(probe_logits, active)
-        replacement = mx.argmax(probe_logits, axis=-1)
-        replacement_logp = self._gather_token_log_probs(probe_logits, replacement)
-        mx.eval(current_logp, replacement, replacement_logp)
+        current_ids = active[0].tolist()
+        current_logp = confidence
+        replacement = active
+        replacement_logp = confidence
+        # Hide the token being scored: visible-position logits can just copy it.
+        # When auditing the whole block, use complementary groups rather than
+        # removing ALL its words. These are grouped masked estimates, not exact
+        # leave-one-out probabilities. Both probes see the same frozen draft.
+        max_group = max(1, (cfg.block_size + 1) // 2)
+        probe_count = math.ceil(len(candidates) / max_group)
+        for offset in range(probe_count):
+            positions = candidates[offset::probe_count]
+            probe_tokens = current_ids.copy()
+            selector = [False] * cfg.block_size
+            for pos in positions:
+                probe_tokens[pos] = self.mask_id
+                selector[pos] = True
+            selector = mx.array([selector], dtype=mx.bool_)
+            logits = self._active_logits(
+                locked_prefix, probe_tokens, generated_offset, min_new_tokens,
+            )
+            proposed = mx.argmax(logits, axis=-1)
+            current_logp = mx.where(selector, self._gather_token_log_probs(logits, active), current_logp)
+            replacement = mx.where(selector, proposed, replacement)
+            replacement_logp = mx.where(selector, self._gather_token_log_probs(logits, proposed), replacement_logp)
+            mx.eval(current_logp, replacement, replacement_logp)
         for pos in candidates:
             audit_visits[pos] += 1
 
@@ -204,7 +220,6 @@ class PhobetorSampler:
         confidence = mx.where(cand_mask, current_logp, confidence)
         mx.eval(confidence)
 
-        current_ids = active[0].tolist()
         replacement_ids = replacement[0].tolist()
         current_lp = current_logp[0].tolist()
         replacement_lp = replacement_logp[0].tolist()
@@ -213,6 +228,8 @@ class PhobetorSampler:
         lowprob_threshold = math.log(max(cfg.audit_current_prob_threshold, 1e-12))
         replacement_threshold = math.log(max(cfg.audit_replacement_conf, 1e-12))
         for pos in candidates:
+            if audit_counts[pos] >= cfg.audit_position_budget:
+                continue
             changed = replacement_ids[pos] != current_ids[pos]
             low_current_prob = current_lp[pos] < lowprob_threshold
             strong_replacement = changed and replacement_lp[pos] >= replacement_threshold
@@ -293,7 +310,9 @@ class PhobetorSampler:
             )
 
             forced = []
-            if self._should_audit(step):
+            # The final fill must leave no masks. Do not spend an audit whose
+            # replacements would never be regenerated.
+            if step < cfg.refinement_steps - 1 and self._should_audit(step):
                 confidence, forced = self._context_audit(
                     locked_prefix,
                     active,

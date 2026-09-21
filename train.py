@@ -52,7 +52,9 @@ MODEL_CONFIG = dict(d_model=1024, n_heads=16, d_ff=3072, n_layers=8,
                     mamba_expand=2.0, d_state=64, mamba_head_dim=64, d_conv=4)
 SAMPLER_CONFIG = SamplerConfig(context_window=1024, block_size=32, overlap=24,
                                refinement_steps=16, temperature=0.8,
-                               audit_every=0, final_polish_rounds=0)
+                               audit_every=1, audit_start_fraction=0.0,
+                               audit_end_fraction=1.0, audit_candidates=32,
+                               final_polish_rounds=0)
 VALIDATION_CONFIG = dict(version=3, objective='conditional_block_denoising', shuffle_seed=1338, mask_seed=20_000_000, batches=VAL_BATCHES,
                          batch_size=VAL_BATCH_SIZE, seq_len=SEQ_LEN, block_size=32, overlap=24, denoising_steps=16)
 TRAINING_CONFIG = dict(version=3, objective='conditional_block_denoising', block_size=32, overlap=24, denoising_steps=16,
@@ -211,6 +213,24 @@ def main():
           f'stride={SAMPLER_CONFIG.stride}, denoising steps={SAMPLER_CONFIG.refinement_steps}')
     print(f'Training: conditional block denoising, batch={BATCH_SIZE} x accumulation={GRAD_ACCUM_STEPS}; '
           f'steps {progress.step+1:,}..{TOTAL_STEPS:,}')
+    print('Speed counts actual model input tokens (prefix + block); step time excludes '
+          'sampling, validation and checkpoint writes. RAM and swap are system-wide.')
+
+    def log_memory(phase):
+        ram, swap = psutil.virtual_memory(), psutil.swap_memory()
+        gib = 1024**3
+        metrics = dict(ram_percent=ram.percent, ram_available_gib=ram.available/gib,
+                       swap_used_gib=swap.used/gib,
+                       swap_growth_gib=(swap.used-initial_swap.used)/gib,
+                       mlx_active_gib=mx.get_active_memory()/gib,
+                       mlx_cache_gib=mx.get_cache_memory()/gib,
+                       mlx_peak_gib=mx.get_peak_memory()/gib)
+        for name, value in metrics.items():
+            run.track(value, name=name, step=progress.step, context={'phase': phase})
+        return (f'RAM {ram.percent:.1f}% | MLX {metrics["mlx_active_gib"]:.1f} GiB '
+                f'(cache {metrics["mlx_cache_gib"]:.1f}, peak {metrics["mlx_peak_gib"]:.1f}) | '
+                f'Swap {metrics["swap_used_gib"]:.2f} GiB '
+                f'({metrics["swap_growth_gib"]:+.2f} since start)')
 
     def metadata():
         return dict(vocab_size=len(tokenizer), model_config=MODEL_CONFIG,
@@ -225,10 +245,16 @@ def main():
 
     def check_swap():
         current = psutil.swap_memory()
-        if (current.used-initial_swap.used)/1024**3 > MAX_SWAP_ALLOWED_GB:
-            raise RuntimeError('New swap allocation exceeded memory guard')
-        if (getattr(current, 'sout', 0)-getattr(initial_swap, 'sout', 0))/1024**3 > MAX_SWAP_WRITES_GB:
-            raise RuntimeError('Swap writes exceeded memory guard')
+        growth = (current.used-initial_swap.used)/1024**3
+        writes = (getattr(current, 'sout', 0)-getattr(initial_swap, 'sout', 0))/1024**3
+        if growth > MAX_SWAP_ALLOWED_GB:
+            print(f'Memory guard | {log_memory("memory_guard")}', flush=True)
+            raise RuntimeError(f'New swap allocation {growth:.2f} GiB exceeded '
+                               f'memory guard ({MAX_SWAP_ALLOWED_GB:.2f} GiB)')
+        if writes > MAX_SWAP_WRITES_GB:
+            print(f'Memory guard | {log_memory("memory_guard")}', flush=True)
+            raise RuntimeError(f'Swap writes {writes:.2f} GiB exceeded '
+                               f'memory guard ({MAX_SWAP_WRITES_GB:.2f} GiB)')
 
     def request_stop(signum, frame):
         nonlocal stopped
@@ -250,6 +276,7 @@ def main():
     loss = grads = accumulated = None
     start_time = time.monotonic()
     try:
+        print(f'Training start | {log_memory("start")}', flush=True)
         for step in range(progress.step+1, TOTAL_STEPS+1):
             stop_if_requested()
             check_swap()
@@ -295,9 +322,11 @@ def main():
                 lr = float(schedule(mx.array(step-1)).item())
                 tokens_per_second = model_tokens/seconds
                 print(f'Step {step:06d} | Loss {total_loss:.4f} | LR {lr:.2e} | Grad {grad_norm:.2f} | '
-                      f'{tokens_per_second:.0f} tok/s | MLX {mx.get_active_memory()/1024**3:.1f} GB', flush=True)
+                      f'{tokens_per_second:.0f} input tok/s | {seconds:.2f} s/step | '
+                      f'{log_memory("train")}', flush=True)
                 for name, value in dict(train_loss=total_loss, learning_rate=lr, grad_norm=grad_norm,
-                                        tokens_per_sec=tokens_per_second).items():
+                                        tokens_per_sec=tokens_per_second, step_seconds=seconds,
+                                        input_tokens_per_step=model_tokens).items():
                     run.track(value, name=name, step=step)
             if step % SAMPLE_INTERVAL == 0:
                 model.eval()
@@ -317,6 +346,7 @@ def main():
                         stop_if_requested()
                 finally:
                     model.train()
+                print(f'After sampling | {log_memory("after_sampling")}', flush=True)
             if step % VAL_INTERVAL == 0 or step == TOTAL_STEPS:
                 last_metrics = evaluate(model, val_data, mask_id)
                 last_val_step = step
@@ -325,6 +355,7 @@ def main():
                 if last_metrics['val_loss'] < best_loss:
                     save_best(CHECKPOINT_DIR, model, {**metadata(), 'step':step, 'tokens_seen':progress.tokens_seen})
                     best_loss = last_metrics['val_loss']
+                print(f'After validation | {log_memory("after_validation")}', flush=True)
                 stop_if_requested()
             if step % SAVE_INTERVAL == 0:
                 gc.collect(); mx.clear_cache()
