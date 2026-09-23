@@ -4,13 +4,14 @@ import mlx.core as mx
 
 
 class TextDataset:
-    def __init__(self, path: str, seq_len: int, dtype=np.uint16, shuffle_seed: int = 1337):
+    def __init__(self, path: str, seq_len: int, dtype=np.uint16, shuffle_seed: int = 1337, repeat: bool = True):
         if not os.path.exists(path):
             raise FileNotFoundError(path)
 
         self.path = path
         self.seq_len = seq_len
         self.shuffle_seed = shuffle_seed
+        self.repeat = repeat
         self.data = np.memmap(path, dtype=dtype, mode="r")
         self.total_tokens = len(self.data)
 
@@ -38,7 +39,11 @@ class TextDataset:
         return self._cached_order
 
     def get_batch(self, batch_size: int, batch_index: int = 0):
+        if batch_size <= 0 or batch_index < 0:
+            raise ValueError('Expected positive batch size and non-negative batch index')
         first_sequence = batch_index * batch_size
+        if not self.repeat and first_sequence + batch_size > self.num_sequences:
+            raise StopIteration('Single pass completed; training examples will not be repeated')
 
         sequence_ids = []
         cursor = first_sequence

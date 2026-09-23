@@ -7,15 +7,15 @@ import mlx.core as mx
 @dataclass(frozen=True)
 class SamplerConfig:
     context_window: int = 1024
-    block_size: int = 32
-    overlap: int = 24
-    refinement_steps: int = 16
+    block_size: int = 16
+    overlap: int = 12
+    refinement_steps: int = 12
     temperature: float = 0.8
 
     audit_every: int = 1
     audit_start_fraction: float = 0.0
     audit_end_fraction: float = 1.0
-    audit_candidates: int = 32
+    audit_candidates: int = 16
     audit_remask_k: int = 1
     audit_current_prob_threshold: float = 0.20
     audit_replacement_conf: float = 0.30
@@ -175,7 +175,6 @@ class PhobetorSampler:
     ):
         cfg = self.config
         m = min(cfg.audit_candidates, cfg.block_size)
-        # A limit on forced replacements must not disable confidence updates.
         available = list(range(cfg.block_size))
         groups = max(1, math.ceil(cfg.block_size / m))
         candidates = sorted(available, key=lambda i: (audit_visits[i], i % groups, i))[:m]
@@ -186,10 +185,6 @@ class PhobetorSampler:
         current_logp = confidence
         replacement = active
         replacement_logp = confidence
-        # Hide the token being scored: visible-position logits can just copy it.
-        # When auditing the whole block, use complementary groups rather than
-        # removing ALL its words. These are grouped masked estimates, not exact
-        # leave-one-out probabilities. Both probes see the same frozen draft.
         max_group = max(1, (cfg.block_size + 1) // 2)
         probe_count = math.ceil(len(candidates) / max_group)
         for offset in range(probe_count):
@@ -310,8 +305,6 @@ class PhobetorSampler:
             )
 
             forced = []
-            # The final fill must leave no masks. Do not spend an audit whose
-            # replacements would never be regenerated.
             if step < cfg.refinement_steps - 1 and self._should_audit(step):
                 confidence, forced = self._context_audit(
                     locked_prefix,

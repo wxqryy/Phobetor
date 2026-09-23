@@ -1,5 +1,8 @@
-"""Phobetor V3: eight shared hybrid blocks, two passes, fresh pretraining."""
+"""Phobetor V4: eight shared hybrid blocks, two passes, fresh pretraining."""
 import gc
+import hashlib
+import json
+from functools import lru_cache
 import math
 from pathlib import Path
 import signal
@@ -20,7 +23,7 @@ from sampler import PhobetorSampler, SamplerConfig
 from training_state import load_best_loss, restore_latest, save_best, save_checkpoint
 
 SEQ_LEN = 1024
-BATCH_SIZE = 1
+BATCH_SIZE = 4
 GRAD_ACCUM_STEPS = 8
 TOTAL_STEPS = 250_000
 WARMUP_STEPS = 2_000
@@ -31,34 +34,39 @@ GRAD_CLIP = 1.0
 SEED = 1337
 LOG_INTERVAL = 25
 SAMPLE_INTERVAL = 500
-SAMPLE_MAX_NEW_TOKENS = 64
-VAL_INTERVAL = 2_000
+SAMPLE_MAX_NEW_TOKENS = 32
+VAL_INTERVAL = 500
 VAL_BATCHES = 64
 VAL_BATCH_SIZE = 2
 BLOCK_VAL_BATCHES = 8
-SAVE_INTERVAL = 500
+SAVE_INTERVAL = 2500
 MAX_CHECKPOINTS = 3
 MAX_SWAP_ALLOWED_GB = 1.0
 MAX_SWAP_WRITES_GB = 4.0
 CHECKPOINT_DIR = './checkpoints'
 SAMPLE_LOG_PATH = './latest_samples.log'
 TOKENIZER_PATH = './tokenizer'
-TRAIN_DATA_PATH = './data/train_tokens.bin'
-VAL_DATA_PATH = './data/val_tokens.bin'
+TRAIN_DATA_PATH = './data/v4_books/train_tokens.bin'
+VAL_DATA_PATH = './data/v4_books/val_tokens.bin'
+DATA_MANIFEST_PATH = './data/v4_books/manifest.json'
+MLX_CACHE_LIMIT_GIB = 1
 AIM_REPO = './.aim'
-SAMPLE_PROMPTS = ('The basic law of', 'Water boils when', 'A triangle has')
+SAMPLE_PROMPTS = ('One morning, a little girl',
+                  'At normal atmospheric pressure, water boils at',
+                  'Two plus three equals')
+SAMPLE_LABELS = ('Speech', 'Physics', 'Addition')
 MODEL_CONFIG = dict(d_model=1024, n_heads=16, d_ff=3072, n_layers=8,
                     recurrent_passes=2, gradient_checkpointing=True,
                     mamba_expand=2.0, d_state=64, mamba_head_dim=64, d_conv=4)
-SAMPLER_CONFIG = SamplerConfig(context_window=1024, block_size=32, overlap=24,
-                               refinement_steps=16, temperature=0.8,
+SAMPLER_CONFIG = SamplerConfig(context_window=1024, block_size=16, overlap=12,
+                               refinement_steps=12, temperature=0.8,
                                audit_every=1, audit_start_fraction=0.0,
-                               audit_end_fraction=1.0, audit_candidates=32,
+                               audit_end_fraction=1.0, audit_candidates=16,
                                final_polish_rounds=0)
-VALIDATION_CONFIG = dict(version=3, objective='conditional_block_denoising', shuffle_seed=1338, mask_seed=20_000_000, batches=VAL_BATCHES,
-                         batch_size=VAL_BATCH_SIZE, seq_len=SEQ_LEN, block_size=32, overlap=24, denoising_steps=16)
-TRAINING_CONFIG = dict(version=3, objective='conditional_block_denoising', block_size=32, overlap=24, denoising_steps=16,
-                       stages='uniform_sampler_stage', loss='mean_hidden_ce',
+VALIDATION_CONFIG = dict(version=4, objective='conditional_block_denoising', shuffle_seed=1338, mask_seed=20_000_000, batches=VAL_BATCHES,
+                         batch_size=VAL_BATCH_SIZE, seq_len=SEQ_LEN, block_size=16, overlap=12, denoising_steps=12)
+TRAINING_CONFIG = dict(version=4, objective='conditional_block_denoising', block_size=16, overlap=12, denoising_steps=12,
+                       stages='balanced_mask_count_1_to_16_zigzag_v1', loss='mean_hidden_ce',
                        batch_size=BATCH_SIZE, grad_accum_steps=GRAD_ACCUM_STEPS,
                        seq_len=SEQ_LEN, seed=SEED,
                        peak_lr=PEAK_LR, min_lr=MIN_LR, warmup_steps=WARMUP_STEPS,
@@ -68,46 +76,82 @@ TRAINING_CONFIG = dict(version=3, objective='conditional_block_denoising', block
 def choose_prefix_length(seq_len, sample_id):
     maximum = seq_len-SAMPLER_CONFIG.block_size
     short = [n for n in (0, 4, 8, 16, 32, 64, 128) if n <= maximum]
-    long = [n for n in (256, 512, 768, 992) if n <= maximum]
+    long = [n for n in (256, 512, 768, maximum) if n <= maximum]
     rng = np.random.default_rng(np.random.SeedSequence([SEED, sample_id]))
     options = short if not long or rng.random() < 0.5 else long
     return int(rng.choice(options))
 
 
-def prepare_training_block(clean, key, mask_id, prefix_length, stage=None, overlap=None):
-    """Sample a conditional denoising stage of prefix + one editable window.
+@lru_cache(maxsize=32)
+def _noise_cycle(cycle, block_size, seed):
+    if block_size < 2 or block_size % 2:
+        raise ValueError('Balanced noise requires an even block size >=2')
+    rng = np.random.default_rng(np.random.SeedSequence([seed, cycle, 4001]))
+    low = rng.permutation(np.arange(1, block_size//2+1))
+    high = rng.permutation(np.arange(block_size//2+1, block_size+1))
+    return tuple(int(n) for pair in zip(low, high) for n in pair)
 
-    Visible tokens are ground truth (teacher forcing), not sampled rollouts.
-    Every example has >=1 mask. Each example averages CE over hidden tokens:
-    a single late-stage mistake weighs more than one of 32 initial mistakes.
-    This is a conditional denoising objective, not the old full-sequence bound.
+
+def balanced_mask_counts(sample_ids, block_size=None, seed=SEED):
+    """Each cycle covers every count exactly once; shuffled low/high alternate.
+
+    Indexed by example ID, so interruption/resume cannot restart the schedule.
+    Noise counts and the number of inference iterations are separate quantities.
+    """
+    block_size = block_size or SAMPLER_CONFIG.block_size
+    return [_noise_cycle(int(i)//block_size, block_size, seed)[int(i)%block_size]
+            for i in sample_ids]
+
+
+def prepare_training_block(clean, key, mask_id, prefix_length, mask_counts, overlap=None):
+    """Clean prefix + a single editable block; no clean future enters the model.
+
+    Noise counts are specified per row. Counts remain balanced even for overlap
+    examples: at count=stride, half can explicitly hide only the new tail.
+    This trains sampled denoising states, not a backpropagated inference rollout.
     """
     batch, length = clean.shape
-    block, steps = SAMPLER_CONFIG.block_size, SAMPLER_CONFIG.refinement_steps
+    block = SAMPLER_CONFIG.block_size
     if not 0 <= prefix_length <= length-block:
         raise ValueError('Prefix and block do not fit source sequence')
-    k_crop, k_stage, k_overlap, k_mask = mx.random.split(key, num=4)
-    if stage is None:
-        stage = int(mx.random.randint(0, steps, shape=(), key=k_stage).item())
-    if not 0 <= stage < steps:
-        raise ValueError('Invalid denoising stage')
-    if overlap is None:
-        overlap = bool((mx.random.uniform(shape=(), key=k_overlap) < 0.5).item())
+    if len(mask_counts) != batch or any(not 1 <= n <= block for n in mask_counts):
+        raise ValueError('One mask count in [1, block_size] is required per row')
+    k_crop, k_overlap, k_mask = mx.random.split(key, num=3)
+    counts = mx.array(mask_counts)[:, None]
     span = prefix_length+block
     starts = mx.random.randint(0, length-span+1, shape=(batch,1), key=k_crop)
     cropped = mx.take_along_axis(clean, starts+mx.arange(span)[None,:], axis=1)
     targets = cropped[:, prefix_length:]
-    if stage == 0 and overlap:
-        mask = mx.broadcast_to(mx.arange(block)[None,:] >= SAMPLER_CONFIG.overlap, targets.shape)
-    else:
-        count = block if stage == 0 else PhobetorSampler._next_mask_count(block, stage-1, steps)
-        count = max(1, count)
-        scores = mx.random.uniform(shape=targets.shape, key=k_mask)
-        ranks = mx.argsort(mx.argsort(scores, axis=-1), axis=-1)
-        mask = ranks < count
+    scores = mx.random.uniform(shape=targets.shape, key=k_mask)
+    ranks = mx.argsort(mx.argsort(scores, axis=-1), axis=-1)
+    mask = ranks < counts
+    if overlap is None:
+        overlap = mx.random.uniform(shape=(batch,1), key=k_overlap) < 0.5
+    tail_mask = mx.arange(block)[None,:] >= SAMPLER_CONFIG.overlap
+    use_tail = (counts == SAMPLER_CONFIG.stride) & mx.array(overlap)
+    mask = mx.where(use_tail, tail_mask, mask)
     noisy = mx.concatenate([cropped[:, :prefix_length], mx.where(mask, mask_id, targets)], axis=1)
-    weights = mask.astype(mx.float32)*block/mx.sum(mask, axis=1, keepdims=True)
+    weights = mask.astype(mx.float32)*block/counts
     return noisy, targets, weights
+
+
+def verify_corpus():
+    from prepare_data import file_hash
+    path = Path(DATA_MANIFEST_PATH)
+    manifest = json.loads(path.read_text())
+    if manifest.get('version') != 4 or manifest.get('name') != 'phobetor_v4_plain_english':
+        raise ValueError('V4 requires its own prepared corpus; run prepare_data.py')
+    content = dict(manifest)
+    corpus_id = content.pop('corpus_id')
+    if hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest() != corpus_id:
+        raise ValueError('Corpus manifest fingerprint differs')
+    if manifest['tokenizer_sha256'] != file_hash(Path(TOKENIZER_PATH)/'tokenizer.json'):
+        raise ValueError('Corpus tokenizer differs from the current tokenizer')
+    for split, filename in (('train', TRAIN_DATA_PATH), ('val', VAL_DATA_PATH)):
+        info = manifest['splits'][split]
+        if Path(filename).stat().st_size != info['tokens']*2 or file_hash(filename) != info['sha256']:
+            raise ValueError(f'{split} data differs from the prepared V4 corpus')
+    return manifest['corpus_id']
 
 
 def block_loss(model, noisy, targets, weights):
@@ -121,17 +165,52 @@ def repetition_metrics(ids):
                 repeated_4gram_fraction=1-len(set(grams))/max(1, len(grams)) if grams else 0.0)
 
 
+def console_table(headers, rows):
+    def cell(value):
+        return json.dumps(str(value), ensure_ascii=False)[1:-1].replace('\u2028', r'\u2028').replace('\u2029', r'\u2029')
+    table = [[cell(v) for v in row] for row in [headers, *rows]]
+    widths = [max(len(row[i]) for row in table) for i in range(len(headers))]
+    border = '+' + '+'.join('-'*(w+2) for w in widths) + '+'
+    line = lambda row: '| ' + ' | '.join(v.ljust(w) for v,w in zip(row,widths)) + ' |'
+    return '\n'.join([border, line(table[0]), border, *[line(row) for row in table[1:]], border])
+
+
+def format_progress(step, total, loss, lr, grad, speed, seconds, interval_seconds, memory):
+    return (f'Step {step}/{total} | Loss {loss:.4f} | LR {lr:.2e} | Grad {grad:.2f} | '
+            f'{speed:.0f} tok/s | {seconds:.2f} s / {interval_seconds:.2f} s | {memory}')
+
+
+def format_validation(step, metrics):
+    keys = ('val_loss', 'val_continuation_loss', 'val_overlap_loss', 'val_refinement_loss')
+    return console_table(['VAL step', 'Loss', 'Continue', 'Overlap', 'Refine'],
+                         [[step, *[f'{metrics[k]:.4f}' for k in keys]]])
+
+
+def format_samples(step, records):
+    rows = [[r['label'], r['prompt']+' >>> '+r['continuation'], r['generated_tokens'],
+             f"{r['unique_token_fraction']:.1%}", f"{r['repeated_4gram_fraction']:.1%}"] for r in records]
+    return console_table([str(step), 'Prompt >>> continuation', 'Tokens', 'Unique', 'Repeat-4'], rows)
+
+
 def evaluate(model, dataset, mask_id):
     previous_mode = model.training
     model.eval()
     try:
         stage_loss = 0.0
+        by_count = {n: [] for n in range(1, SAMPLER_CONFIG.block_size+1)}
         for i in range(VAL_BATCHES):
             clean = dataset.get_batch(VAL_BATCH_SIZE, batch_index=i)
+            counts = balanced_mask_counts(range(i*VAL_BATCH_SIZE, (i+1)*VAL_BATCH_SIZE), seed=SEED+1)
             prepared = prepare_training_block(clean, mx.random.key(20_000_000+i), mask_id,
-                                              choose_prefix_length(SEQ_LEN, 20_000_000+i))
-            stage_loss += float(block_loss(model, *prepared).item())
+                                              choose_prefix_length(SEQ_LEN, 20_000_000+i), counts)
+            noisy, targets, weights = prepared
+            logits = model(noisy, output_start=noisy.shape[1]-targets.shape[1])
+            losses = mx.mean(nn.losses.cross_entropy(logits, targets)*weights, axis=1).tolist()
+            stage_loss += sum(losses)/len(losses)
+            for n, value in zip(counts, losses): by_count[n].append(value)
         metrics = {'val_loss': stage_loss / VAL_BATCHES}
+        metrics.update({f'val_mask_{n:02d}_loss': sum(values)/len(values)
+                        for n, values in by_count.items() if values})
         block = SAMPLER_CONFIG.block_size
         for name, old_tokens in (('val_continuation_loss', 0), ('val_overlap_loss', SAMPLER_CONFIG.overlap)):
             total = 0.0
@@ -150,7 +229,8 @@ def evaluate(model, dataset, mask_id):
             prepared = prepare_training_block(
                 clean, mx.random.key(30_000_000+i), mask_id,
                 choose_prefix_length(SEQ_LEN, 30_000_000+i),
-                stage=SAMPLER_CONFIG.refinement_steps-1,
+                mask_counts=[max(1, PhobetorSampler._next_mask_count(
+                    block, SAMPLER_CONFIG.refinement_steps-2, SAMPLER_CONFIG.refinement_steps))]*VAL_BATCH_SIZE,
             )
             late_loss += float(block_loss(model, *prepared).item())
         metrics['val_refinement_loss'] = late_loss / BLOCK_VAL_BATCHES
@@ -161,11 +241,13 @@ def evaluate(model, dataset, mask_id):
         model.train(previous_mode)
 
 
-def make_optimizer():
+def make_optimizer(total_steps=None):
+    total_steps = TOTAL_STEPS if total_steps is None else total_steps
+    warmup = min(WARMUP_STEPS, max(1, total_steps-1))
     schedule = opt.join_schedules([
-        opt.linear_schedule(0.0, PEAK_LR, WARMUP_STEPS),
-        opt.cosine_decay(PEAK_LR, TOTAL_STEPS-WARMUP_STEPS, end=MIN_LR),
-    ], [WARMUP_STEPS])
+        opt.linear_schedule(0.0, PEAK_LR, warmup),
+        opt.cosine_decay(PEAK_LR, max(1, total_steps-warmup), end=MIN_LR),
+    ], [warmup])
     def exempt(path, weight):
         return weight.ndim < 2 or path.rsplit('.', 1)[-1] in {'A_log', 'D', 'dt_bias'}
     optimizer = opt.MultiOptimizer([
@@ -179,42 +261,61 @@ def main():
     if SEQ_LEN < SAMPLER_CONFIG.block_size:
         raise ValueError('Training context is shorter than the generation block')
     SAMPLER_CONFIG.validate()
+    corpus_id = verify_corpus()
+    training_config = {**TRAINING_CONFIG, 'corpus_id': corpus_id}
+    validation_config = {**VALIDATION_CONFIG, 'corpus_id': corpus_id}
+    mx.set_cache_limit(MLX_CACHE_LIMIT_GIB*1024**3)
     initial_swap = psutil.swap_memory()
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH, local_files_only=True)
     mask_id = tokenizer.mask_token_id
     if mask_id is None or tokenizer.eos_token_id is None:
         raise ValueError('Tokenizer must define MASK and EOS')
-    train_data = TextDataset(TRAIN_DATA_PATH, SEQ_LEN, shuffle_seed=SEED)
+    train_data = TextDataset(TRAIN_DATA_PATH, SEQ_LEN, shuffle_seed=SEED, repeat=False)
     val_data = TextDataset(VAL_DATA_PATH, SEQ_LEN, shuffle_seed=1338)
+    single_pass_steps = train_data.num_sequences // (BATCH_SIZE*GRAD_ACCUM_STEPS)
+    final_step = min(TOTAL_STEPS, single_pass_steps)
+    if final_step < 1:
+        raise ValueError('Training corpus is too small for one full optimizer update')
+    training_config.update(data_policy='single_pass_no_replacement', schedule_steps=single_pass_steps)
     mx.random.seed(SEED)
     model = PhobetorModel(vocab_size=len(tokenizer), **MODEL_CONFIG)
-    optimizer, schedule = make_optimizer()
+    optimizer, schedule = make_optimizer(single_pass_steps)
     Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
     progress, resumed = restore_latest(CHECKPOINT_DIR, model, optimizer, MODEL_CONFIG, len(tokenizer))
-    if resumed and resumed.get('training_config') != TRAINING_CONFIG:
+    if resumed and resumed.get('training_config') != training_config:
         raise ValueError('Checkpoint training configuration differs; use a separate checkpoint directory')
     mx.eval(model.parameters(), optimizer.state)
     model.train()
     sampler = PhobetorSampler(model, tokenizer, SAMPLER_CONFIG, SEED)
-    best_loss = load_best_loss(CHECKPOINT_DIR, VALIDATION_CONFIG)
+    best_loss = load_best_loss(CHECKPOINT_DIR, validation_config)
     last_metrics = resumed.get('validation_metrics', {})
     last_val_step = resumed.get('val_step')
     last_sample = resumed.get('sample', '')
     last_saved_step = progress.step
     stopped = False
-    run = Run(repo=AIM_REPO, experiment='phobetor_v3_hybrid_twopass')
+    run = Run(repo=AIM_REPO, experiment='phobetor_v4_plain_english')
     run['model'] = MODEL_CONFIG
-    run['training'] = TRAINING_CONFIG
+    run['training'] = training_config
     run['sampler'] = SAMPLER_CONFIG.to_dict()
-    run['validation'] = VALIDATION_CONFIG
+    run['validation'] = validation_config
+    run['sample_evaluation'] = dict(prompts=list(SAMPLE_PROMPTS), seed=SEED, max_new_tokens=SAMPLE_MAX_NEW_TOKENS)
     run['resumed_from_step'] = progress.step
-    print(f'V3: {MODEL_CONFIG["n_layers"]} hybrid blocks x {MODEL_CONFIG["recurrent_passes"]} shared passes')
+    run['checkpoint_policy'] = dict(periodic_interval=SAVE_INTERVAL, periodic_keep=MAX_CHECKPOINTS, emergency_keep=1, best_keep=1)
+    print(f'V4: {MODEL_CONFIG["n_layers"]} hybrid blocks x {MODEL_CONFIG["recurrent_passes"]} shared passes')
     print(f'Generation: window={SAMPLER_CONFIG.block_size}, editable overlap={SAMPLER_CONFIG.overlap}, '
           f'stride={SAMPLER_CONFIG.stride}, denoising steps={SAMPLER_CONFIG.refinement_steps}')
     print(f'Training: conditional block denoising, batch={BATCH_SIZE} x accumulation={GRAD_ACCUM_STEPS}; '
-          f'steps {progress.step+1:,}..{TOTAL_STEPS:,}')
-    print('Speed counts actual model input tokens (prefix + block); step time excludes '
-          'sampling, validation and checkpoint writes. RAM and swap are system-wide.')
+          f'steps {progress.step+1:,}..{final_step:,}; single pass, no repeated examples')
+    print(f'Noise: balanced mask counts 1..{SAMPLER_CONFIG.block_size}, shuffled low/high cycles; '
+          f'corpus={corpus_id[:12]}')
+    print(f'Checkpoints: every {SAVE_INTERVAL} steps, keep {MAX_CHECKPOINTS} periodic + 1 emergency + 1 best.')
+    print('Generation uses masked confidence checks in addition to denoising fills '
+          '(default: 12 fills + 22 checks per window).')
+    print('tok/s counts processed context + target tokens. '
+          'Time: last training step / elapsed since the previous progress line, '
+          'including evaluation and saves. RAM is system-wide.')
+    print(f'Samples: three fixed prompts, seed={SEED}, up to {SAMPLE_MAX_NEW_TOKENS} NEW tokens; '
+          'prompt stays fixed. Detailed mask-level validation and MLX memory metrics remain in Aim.')
 
     def log_memory(phase):
         ram, swap = psutil.virtual_memory(), psutil.swap_memory()
@@ -227,21 +328,24 @@ def main():
                        mlx_peak_gib=mx.get_peak_memory()/gib)
         for name, value in metrics.items():
             run.track(value, name=name, step=progress.step, context={'phase': phase})
-        return (f'RAM {ram.percent:.1f}% | MLX {metrics["mlx_active_gib"]:.1f} GiB '
-                f'(cache {metrics["mlx_cache_gib"]:.1f}, peak {metrics["mlx_peak_gib"]:.1f}) | '
-                f'Swap {metrics["swap_used_gib"]:.2f} GiB '
-                f'({metrics["swap_growth_gib"]:+.2f} since start)')
+        memory = f'RAM {ram.percent:.1f}%'
+        if phase == 'memory_guard':
+            memory += (f' | Swap {metrics["swap_used_gib"]:.2f} GiB '
+                       f'({metrics["swap_growth_gib"]:+.2f} since start)')
+        return memory
+
 
     def metadata():
         return dict(vocab_size=len(tokenizer), model_config=MODEL_CONFIG,
-                    training_config=TRAINING_CONFIG, sampler_config=SAMPLER_CONFIG.to_dict(),
-                    validation_config=VALIDATION_CONFIG, validation_metrics=last_metrics,
-                    block_validation_config=dict(version=3, block_size=SAMPLER_CONFIG.block_size,
+                    training_config=training_config, sampler_config=SAMPLER_CONFIG.to_dict(),
+                    validation_config=validation_config, validation_metrics=last_metrics,
+                    block_validation_config=dict(version=4, block_size=SAMPLER_CONFIG.block_size,
                                                  overlap=SAMPLER_CONFIG.overlap, batches=BLOCK_VAL_BATCHES),
-                    val_step=last_val_step, val_loss=last_metrics.get('val_loss'), sample=last_sample)
+                    val_step=last_val_step, val_loss=last_metrics.get('val_loss'), sample=last_sample,
+                    sample_evaluation=dict(prompts=list(SAMPLE_PROMPTS), seed=SEED, max_new_tokens=SAMPLE_MAX_NEW_TOKENS))
 
-    def snapshot():
-        return save_checkpoint(CHECKPOINT_DIR, model, optimizer, progress, metadata(), MAX_CHECKPOINTS)
+    def snapshot(kind="periodic"):
+        return save_checkpoint(CHECKPOINT_DIR, model, optimizer, progress, metadata(), MAX_CHECKPOINTS, kind=kind)
 
     def check_swap():
         current = psutil.swap_memory()
@@ -275,18 +379,21 @@ def main():
     first_grad = True
     loss = grads = accumulated = None
     start_time = time.monotonic()
+    interval_start, interval_steps = start_time, 0
     try:
         print(f'Training start | {log_memory("start")}', flush=True)
-        for step in range(progress.step+1, TOTAL_STEPS+1):
+        for step in range(progress.step+1, final_step+1):
             stop_if_requested()
             check_swap()
             tick = time.monotonic()
-            accumulated, total_loss, model_tokens = None, 0.0, 0
+            accumulated, total_loss, model_tokens, hidden_tokens = None, 0.0, 0, 0
             for micro in range(GRAD_ACCUM_STEPS):
                 micro_id = (step-1)*GRAD_ACCUM_STEPS + micro
                 clean = train_data.get_batch(BATCH_SIZE, batch_index=micro_id)
                 key = mx.random.key(2_000_000+micro_id)
-                prepared = prepare_training_block(clean, key, mask_id, choose_prefix_length(SEQ_LEN, micro_id))
+                counts = balanced_mask_counts(range(micro_id*BATCH_SIZE, (micro_id+1)*BATCH_SIZE))
+                hidden_tokens += sum(counts)
+                prepared = prepare_training_block(clean, key, mask_id, choose_prefix_length(SEQ_LEN, micro_id), counts)
                 try:
                     loss, grads = grad_runner(*prepared)
                     mx.eval(loss, grads)
@@ -315,29 +422,35 @@ def main():
             accumulated = None
             stop_if_requested()
             seconds = time.monotonic()-tick
-            if step % SAVE_INTERVAL == 0:
-                snapshot()
-                last_saved_step = step
-            if step % LOG_INTERVAL == 0:
+            interval_steps += 1
+            if step % LOG_INTERVAL == 0 or step == final_step:
                 lr = float(schedule(mx.array(step-1)).item())
                 tokens_per_second = model_tokens/seconds
-                print(f'Step {step:06d} | Loss {total_loss:.4f} | LR {lr:.2e} | Grad {grad_norm:.2f} | '
-                      f'{tokens_per_second:.0f} input tok/s | {seconds:.2f} s/step | '
-                      f'{log_memory("train")}', flush=True)
+                memory = log_memory('train')
+                logged_at = time.monotonic()
+                interval_seconds = logged_at-interval_start
+                print(format_progress(step, final_step, total_loss, lr, grad_norm, tokens_per_second,
+                                      seconds, interval_seconds, memory), flush=True)
+                run.track(interval_seconds, name='log_interval_seconds', step=step)
+                run.track(interval_steps, name='log_interval_steps', step=step)
+                interval_start, interval_steps = logged_at, 0
                 for name, value in dict(train_loss=total_loss, learning_rate=lr, grad_norm=grad_norm,
                                         tokens_per_sec=tokens_per_second, step_seconds=seconds,
-                                        input_tokens_per_step=model_tokens).items():
+                                        input_tokens_per_step=model_tokens, hidden_tokens_per_step=hidden_tokens,
+                                        hidden_tokens_per_sec=hidden_tokens/seconds).items():
                     run.track(value, name=name, step=step)
             if step % SAMPLE_INTERVAL == 0:
                 model.eval()
+                sample_records = []
                 try:
-                    for prompt in SAMPLE_PROMPTS:
+                    for label, prompt in zip(SAMPLE_LABELS, SAMPLE_PROMPTS):
                         ids = sampler.generate_ids(tokenizer.encode(prompt, add_special_tokens=False),
                                                    max_new_tokens=SAMPLE_MAX_NEW_TOKENS, min_new_tokens=8)
-                        text = prompt+tokenizer.decode(ids, skip_special_tokens=True)
+                        continuation = tokenizer.decode(ids, skip_special_tokens=True)
+                        text = prompt+continuation
                         metrics = repetition_metrics(ids)
                         if prompt == SAMPLE_PROMPTS[0]: last_sample = text
-                        print(f'SAMPLE {step} | {metrics} | {text!r}', flush=True)
+                        sample_records.append(dict(label=label, prompt=prompt, continuation=continuation, **metrics))
                         context = {'prompt':prompt}
                         run.track(Text(text), name='sample', step=step, context=context)
                         for name,value in metrics.items():run.track(value,name='sample_'+name,step=step,context=context)
@@ -346,22 +459,27 @@ def main():
                         stop_if_requested()
                 finally:
                     model.train()
-                print(f'After sampling | {log_memory("after_sampling")}', flush=True)
-            if step % VAL_INTERVAL == 0 or step == TOTAL_STEPS:
+                print(format_samples(step, sample_records), flush=True)
+                log_memory('after_sampling')
+            if step % VAL_INTERVAL == 0 or step == final_step:
                 last_metrics = evaluate(model, val_data, mask_id)
                 last_val_step = step
-                print(f'VAL {step}: {last_metrics}', flush=True)
+                print(format_validation(step, last_metrics), flush=True)
                 for name,value in last_metrics.items():run.track(value,name=name,step=step)
                 if last_metrics['val_loss'] < best_loss:
                     save_best(CHECKPOINT_DIR, model, {**metadata(), 'step':step, 'tokens_seen':progress.tokens_seen})
                     best_loss = last_metrics['val_loss']
-                print(f'After validation | {log_memory("after_validation")}', flush=True)
+                log_memory('after_validation')
                 stop_if_requested()
             if step % SAVE_INTERVAL == 0:
+                snapshot()
+                last_saved_step = step
                 gc.collect(); mx.clear_cache()
-        if progress.step > 0:
-            snapshot()
+        if progress.step > last_saved_step:
+            snapshot(kind="emergency")
             last_saved_step = progress.step
+        if progress.step >= single_pass_steps:
+            print('Single pass completed. Final checkpoint saved; training will not restart the corpus.')
     except KeyboardInterrupt:
         print('\nTraining interrupted; preserving completed updates.')
     finally:
@@ -369,7 +487,7 @@ def main():
         if progress.step > last_saved_step and progress.safe_to_save:
             gc.collect(); mx.clear_cache()
             try:
-                snapshot()
+                snapshot(kind="emergency")
                 print(f'Emergency checkpoint saved at completed step {progress.step}')
             except Exception as exc:
                 print(f'Emergency save failed; previous checkpoints preserved: {exc}')

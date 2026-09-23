@@ -69,13 +69,26 @@ class TrainingProgress:
 
 
 def checkpoint_step(path):
+    path = Path(path)
+    if path.name == "emergency_checkpoint":
+        try:
+            step = json.loads((path / "metrics.json").read_text())["step"]
+            return step if type(step) is int and step >= 0 else -1
+        except (OSError, ValueError, KeyError, TypeError):
+            return -1
     match = re.fullmatch(r"ckpt_step_(\d+)(?:_\d+)?", Path(path).name)
     return int(match.group(1)) if match else -1
 
 
-def checkpoint_paths(directory):
+def checkpoint_paths(directory, include_emergency=True):
+    root = Path(directory)
+    paths = [p for p in root.glob("ckpt_step_*") if p.is_dir() and checkpoint_step(p) >= 0]
+    if include_emergency:
+        emergency = _recover_slot(root, "emergency_checkpoint")
+        if emergency.is_dir():
+            paths.append(emergency)
     return sorted(
-        (p for p in Path(directory).glob("ckpt_step_*") if p.is_dir() and checkpoint_step(p) >= 0),
+        paths,
         key=lambda p: (checkpoint_step(p), p.stat().st_mtime_ns),
         reverse=True,
     )
@@ -155,7 +168,37 @@ def _write_snapshot(path, model, metrics, optimizer=None):
     _sync_directory(path)
 
 
-def save_checkpoint(directory, model, optimizer, progress, metadata, max_checkpoints=10):
+def _recover_slot(root, name):
+    path, previous = root / name, root / f".{name}.previous"
+    if not path.exists() and previous.exists():
+        os.replace(previous, path)
+        _sync_directory(root)
+    return path
+
+
+def _publish_slot(root, temp, name):
+    path = _recover_slot(root, name)
+    previous = root / f".{name}.previous"
+    if previous.exists():
+        shutil.rmtree(previous)
+    if path.exists():
+        os.replace(path, previous)
+        _sync_directory(root)
+    try:
+        os.replace(temp, path)
+        _sync_directory(root)
+    except BaseException:
+        _recover_slot(root, name)
+        raise
+    if previous.exists():
+        shutil.rmtree(previous)
+        _sync_directory(root)
+    return path
+
+
+def save_checkpoint(directory, model, optimizer, progress, metadata, max_checkpoints=3, kind="periodic"):
+    if kind not in {"periodic", "emergency"}:
+        raise ValueError("Unknown checkpoint kind")
     if not progress.safe_to_save:
         raise RuntimeError("Refusing to save an interrupted or invalid optimizer update")
     if max_checkpoints < 1:
@@ -166,6 +209,7 @@ def save_checkpoint(directory, model, optimizer, progress, metadata, max_checkpo
     require_finite(optimizer.state, "checkpoint optimizer state")
     metrics = {
         **metadata, "checkpoint_version": 2, "step": progress.step,
+        "checkpoint_kind": kind,
         "train_loss": progress.train_loss, "tokens_seen": progress.tokens_seen,
     }
     root = Path(directory)
@@ -176,13 +220,19 @@ def save_checkpoint(directory, model, optimizer, progress, metadata, max_checkpo
     temp = Path(tempfile.mkdtemp(prefix=".tmp_ckpt_", dir=root))
     try:
         _write_snapshot(temp, model, metrics, optimizer)
-        os.replace(temp, path)
-        _sync_directory(root)
+        if kind == "emergency":
+            path = _publish_slot(root, temp, "emergency_checkpoint")
+        else:
+            os.replace(temp, path)
+            _sync_directory(root)
     finally:
         if temp.exists():
             shutil.rmtree(temp, ignore_errors=True)
+    if kind == "emergency":
+        print(f"Emergency checkpoint saved: {path}")
+        return path
     valid = []
-    for old in checkpoint_paths(root):
+    for old in checkpoint_paths(root, include_emergency=False):
         try:
             inspect_checkpoint(old)
         except (ValueError, KeyError, TypeError, OSError, SafetensorError):

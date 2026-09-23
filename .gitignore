@@ -1,13 +1,23 @@
-.venv
-.aim
-checkpoints
-data
-latest_samples.log
+# Local environment and caches
+.venv/
+.aim/
+.idea/
+__pycache__/
+.pytest_cache/
+*.py[cod]
 .DS_Store
-.idea
-__pycache__
-v1
-tests
-experiments
-v2
-README.md
+
+# Prepared corpora, training output and terminal logs
+/data/
+/checkpoints/
+/latest_samples.log
+/prepare_v4*.log
+/train_v4*.log
+/speed_v4*.log
+
+# Local archives, tests and experiment artifacts
+/v1/
+/v2/
+/v3/
+/tests/
+/experiments/
