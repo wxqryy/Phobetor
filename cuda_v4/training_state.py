@@ -84,12 +84,15 @@ def restore_checkpoint(path, model, optimizer, expected_model_config, expected_c
     if config['batch_size'] * config['grad_accum_steps'] != 32 or config['seq_len'] != 1024:
         raise ValueError('Effective batch or sequence length differs')
     expected = dict(objective='conditional_block_denoising', block_size=16, overlap=12,
-                    denoising_steps=12, stages='balanced_mask_count_1_to_16_zigzag_v1',
+                    denoising_steps=12,
                     loss='mean_hidden_ce', peak_lr=2.5e-4, min_lr=2.5e-5,
                     warmup_steps=2000, seed=1337)
     for key, value in expected.items():
         if config.get(key) != value:
             raise ValueError(f'Training setting {key} differs from V4 source checkpoint')
+    if config.get('stages') not in {'balanced_mask_count_1_to_16_zigzag_v1',
+                                   'continuation_heavy_16_8_4_4_v1'}:
+        raise ValueError('Unsupported V4 mask schedule')
     if not (path / 'optimizer.safetensors').is_file():
         raise ValueError('Full optimizer checkpoint is required to resume training')
     source_backend = metrics.get('backend', 'mlx')
@@ -180,8 +183,9 @@ def save_best(directory, model, metrics):
     return _safe_snapshot(directory, 'best_model', model, None, {**metrics, 'backend': 'cuda', 'checkpoint_kind': 'best'})
 
 
-def load_best_loss(directory):
+def load_best_loss(directory, metric='val_loss'):
     path = Path(directory) / 'best_model' / 'metrics.json'
     if not path.is_file():
         return math.inf
-    return float(json.loads(path.read_text()).get('val_loss', math.inf))
+    metrics = json.loads(path.read_text())
+    return float(metrics.get('validation_metrics', {}).get(metric, metrics.get(metric, math.inf)))

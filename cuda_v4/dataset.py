@@ -66,6 +66,26 @@ def balanced_mask_counts(sample_ids, block_size=16, seed=1337):
     return counts
 
 
+def continuation_heavy_mask_counts(sample_ids, block_size=16, seed=1337):
+    if block_size != 16:
+        raise ValueError('Continuation-heavy schedule requires 16-token blocks')
+    cycles = {}
+    counts = []
+    for sample_id in sample_ids:
+        cycle, offset = divmod(int(sample_id), 32)
+        if cycle not in cycles:
+            rng = np.random.default_rng(np.random.SeedSequence([seed, cycle, 4002]))
+            levels = np.concatenate((
+                np.full(16, 16, dtype=np.int64),
+                rng.integers(12, 16, size=8),
+                rng.integers(4, 12, size=4),
+                rng.integers(1, 4, size=4),
+            ))
+            cycles[cycle] = rng.permutation(levels).tolist()
+        counts.append(cycles[cycle][offset])
+    return counts
+
+
 def prepare_training_block(clean, mask_id, prefix_length, mask_counts, random_seed, block_size=16, overlap=12):
     batch, length = clean.shape
     if not 0 <= prefix_length <= length - block_size:

@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
-from dataset import TextDataset, balanced_mask_counts, choose_prefix_length, prepare_training_block
+from dataset import TextDataset, balanced_mask_counts, choose_prefix_length, continuation_heavy_mask_counts, prepare_training_block
 from model import PhobetorModel
 from sampler import PhobetorSampler, SamplerConfig
 from training_state import checkpoint_paths, load_best_loss, make_optimizer, restore_checkpoint, save_best, save_checkpoint
@@ -44,6 +44,8 @@ SAMPLER_CONFIG = SamplerConfig(context_window=1024, block_size=16, overlap=12,
                                audit_every=1, audit_start_fraction=0.0,
                                audit_end_fraction=1.0, audit_candidates=16,
                                final_polish_rounds=0)
+BALANCED_STAGE = 'balanced_mask_count_1_to_16_zigzag_v1'
+CONTINUATION_HEAVY_STAGE = 'continuation_heavy_16_8_4_4_v1'
 
 
 def parse_args():
@@ -59,6 +61,7 @@ def parse_args():
     parser.add_argument('--skip-samples', action='store_true')
     parser.add_argument('--skip-validation', action='store_true')
     parser.add_argument('--aim', action='store_true')
+    parser.add_argument('--mask-schedule', choices=('auto', 'balanced', 'continuation-heavy'), default='auto')
     return parser.parse_args()
 
 
@@ -190,7 +193,7 @@ def sample_outputs(model, tokenizer, step, sample_log):
         model.train(was_training)
 
 
-def train_update(model, optimizer, dataset, mask_id, step, micro_batch, device, schedule_steps):
+def train_update(model, optimizer, dataset, mask_id, step, micro_batch, device, schedule_steps, mask_stage):
     accum = EFFECTIVE_BATCH // micro_batch
     optimizer.zero_grad(set_to_none=True)
     total_loss = 0.0
@@ -200,7 +203,9 @@ def train_update(model, optimizer, dataset, mask_id, step, micro_batch, device, 
         first = (step - 1) * EFFECTIVE_BATCH + micro * micro_batch
         clean = dataset.get_rows(first, micro_batch, device)
         micro_id = (step - 1) * accum + micro
-        counts = balanced_mask_counts(range(first, first + micro_batch))
+        sample_ids = range(first, first + micro_batch)
+        counts = (continuation_heavy_mask_counts(sample_ids) if mask_stage == CONTINUATION_HEAVY_STAGE
+                  else balanced_mask_counts(sample_ids))
         prefix = choose_prefix_length(SEQ_LEN, micro_id)
         prepared = prepare_training_block(clean, mask_id, prefix, counts, 2_000_000 + micro_id)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == 'cuda'):
@@ -259,6 +264,9 @@ def main():
         resumed = restore_checkpoint(args.source_checkpoint, model, optimizer, MODEL_CONFIG, corpus_id)
         print(f'Imported complete MLX checkpoint: {args.source_checkpoint}', flush=True)
     step_completed = resumed['step']
+    source_stage = resumed['training_config']['stages']
+    mask_stage = (source_stage if args.mask_schedule == 'auto' else
+                  CONTINUATION_HEAVY_STAGE if args.mask_schedule == 'continuation-heavy' else BALANCED_STAGE)
     tokens_seen = resumed['tokens_seen']
     last_loss = resumed.get('train_loss')
     if final_step <= step_completed:
@@ -271,7 +279,8 @@ def main():
     sample_log = Path('latest_samples_cuda.log')
     validation_metrics = resumed.get('validation_metrics', {}) if resumed.get('backend') == 'cuda' else {}
     val_step = resumed.get('val_step') if resumed.get('backend') == 'cuda' else None
-    best_loss = load_best_loss(checkpoint_dir)
+    best_metric = 'val_continuation_loss' if mask_stage == CONTINUATION_HEAVY_STAGE else 'val_loss'
+    best_loss = load_best_loss(checkpoint_dir, best_metric)
     aim_run = None
     if args.aim and not args.benchmark_steps:
         from aim import Run
@@ -283,6 +292,7 @@ def main():
         config = dict(resumed['training_config'])
         config['batch_size'] = args.micro_batch
         config['grad_accum_steps'] = EFFECTIVE_BATCH // args.micro_batch
+        config['stages'] = mask_stage
         return dict(vocab_size=len(tokenizer), model_config=MODEL_CONFIG, training_config=config,
                     sampler_config=SAMPLER_CONFIG.to_dict(), step=step_completed,
                     tokens_seen=tokens_seen, train_loss=last_loss,
@@ -308,7 +318,7 @@ def main():
           f'params {sum(p.numel() for p in model.parameters()):,}', flush=True)
     print(f'Start {step_completed + 1}/{final_step} | micro-batch {args.micro_batch} x '
           f'accumulation {EFFECTIVE_BATCH // args.micro_batch} = effective {EFFECTIVE_BATCH} | '
-          f'{"benchmark only" if benchmark else "training"}', flush=True)
+          f'{"benchmark only" if benchmark else "training"} | mask schedule {mask_stage}', flush=True)
     model.train()
     torch.cuda.reset_peak_memory_stats()
     try:
@@ -316,7 +326,8 @@ def main():
             step = step_completed + 1
             tick = time.monotonic()
             loss, gradient, lr, tokens, hidden = train_update(
-                model, optimizer, train_data, tokenizer.mask_token_id, step, args.micro_batch, device, schedule_steps)
+                model, optimizer, train_data, tokenizer.mask_token_id, step, args.micro_batch, device,
+                schedule_steps, mask_stage)
             safe_to_save = False
             optimizer.step()
             torch.cuda.synchronize()
@@ -365,9 +376,9 @@ def main():
                 if aim_run is not None:
                     for name, value in validation_metrics.items():
                         aim_run.track(value, name=name, step=step)
-                if validation_metrics['val_loss'] < best_loss:
+                if validation_metrics[best_metric] < best_loss:
                     save_best(checkpoint_dir, model, metadata())
-                    best_loss = validation_metrics['val_loss']
+                    best_loss = validation_metrics[best_metric]
             if step % SAVE_INTERVAL == 0:
                 path = save_checkpoint(checkpoint_dir, model, optimizer, metadata())
                 print(f'Checkpoint saved: {path}', flush=True)
