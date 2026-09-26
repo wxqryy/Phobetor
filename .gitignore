@@ -10,10 +10,20 @@ __pycache__/
 # Prepared corpora, training output and terminal logs
 /data/
 /checkpoints/
+/checkpoints_cuda/
 /latest_samples.log
+/latest_samples_cuda.log
 /prepare_v4*.log
 /train_v4*.log
 /speed_v4*.log
+/cuda_v4/.venv/
+/cuda_v4/data/
+/cuda_v4/tokenizer/
+/cuda_v4/source_checkpoint/
+/cuda_v4/checkpoints_cuda/
+/cuda_v4/parity.json
+/cuda_v4/latest_samples_cuda.log
+/cuda_v4/*.log
 
 # Local archives, tests and experiment artifacts
 /v1/
