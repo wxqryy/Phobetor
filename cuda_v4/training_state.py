@@ -13,7 +13,7 @@ import torch
 
 def checkpoint_step(path):
     path = Path(path)
-    if path.name == 'emergency_checkpoint':
+    if path.name in {'emergency_checkpoint', 'norm_f.weight'}:
         try:
             return int(json.loads((path / 'metrics.json').read_text())['step'])
         except (OSError, ValueError, KeyError, TypeError):
@@ -31,6 +31,12 @@ def checkpoint_paths(directory):
         os.replace(previous, emergency)
     if emergency.is_dir():
         paths.append(emergency)
+    legacy = root / 'norm_f.weight'
+    legacy_previous = root / '.norm_f.weight.previous'
+    if not legacy.exists() and legacy_previous.exists():
+        os.replace(legacy_previous, legacy)
+    if legacy.is_dir() and checkpoint_step(legacy) >= 0:
+        paths.append(legacy)
     return sorted(paths, key=lambda p: (checkpoint_step(p), p.stat().st_mtime_ns), reverse=True)
 
 
@@ -122,12 +128,12 @@ def _safe_snapshot(root, name, model, optimizer, metrics):
         del model_tensors
         if optimizer is not None:
             optimizer_tensors = {}
-            for name, parameter in model.named_parameters():
-                group = _source_group(name, parameter)
+            for parameter_name, parameter in model.named_parameters():
+                group = _source_group(parameter_name, parameter)
                 state = optimizer.state[parameter]
                 if int(state['step'].item()) != metrics['step']:
-                    raise ValueError(f'Optimizer step differs for {name}')
-                stem = f'states.{group}.{name}'
+                    raise ValueError(f'Optimizer step differs for {parameter_name}')
+                stem = f'states.{group}.{parameter_name}'
                 optimizer_tensors[stem + '.m'] = state['exp_avg'].detach().cpu().contiguous()
                 optimizer_tensors[stem + '.v'] = state['exp_avg_sq'].detach().cpu().contiguous()
             for group in (0, 1):
