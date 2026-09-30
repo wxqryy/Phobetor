@@ -1,0 +1,4 @@
+numpy>=1.26,<3
+safetensors>=0.5,<1
+transformers>=4.46,<6
+psutil>=5.9,<8

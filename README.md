@@ -2,14 +2,14 @@
 
 I'm building a small text generation model through experiments with architecture,
 training, and sampling. The idea is to generate text in overlapping blocks and
-let the model revise them before moving on. I use MLX and train on an Apple
-Silicon Mac while I work out what works.
+let the model revise them before moving on. I started with MLX on an Apple
+Silicon Mac and later ran CUDA experiments on an RTX 3070 Ti.
 
-## How it works
+## How V4 works
 
-I combine bidirectional Mamba-2, attention, and SwiGLU in eight blocks and run
-through them twice with shared weights. The model can look at the whole available
-context, but generation happens inside a small active window.
+In V4, I combine bidirectional Mamba-2, attention, and SwiGLU in eight blocks
+and run through them twice with shared weights. The model can look at the whole
+available context, but generation happens inside a small active window.
 
 In V4, that window holds 16 tokens. The sampler fills masked positions, checks
 its confidence, and masks some predictions again so the model can revise them.
@@ -56,7 +56,7 @@ At around 7,000 steps on UltraTextbooks, I was still getting incoherent text,
 numbers, and markup. I decided to try books and a smaller generation window.
 I don't know how much of the problem came from the data versus the training setup.
 
-### V4 — current
+### V4
 
 I kept the V3 architecture and tokenizer. I changed the corpus to English books,
 reduced the window to 16 tokens with a 12-token overlap, and set refinement to
@@ -70,6 +70,35 @@ understand which choices actually help it learn.
 
 I changed too many things between versions to treat their losses or step counts
 as a fair comparison.
+
+### V4.2
+
+I wanted to check whether Mamba was causing the generation problems, so I made
+an attention-only CUDA version. It uses 16 attention and SwiGLU layers in one
+pass. I kept the 32,768-token tokenizer, the book corpus, and the 16-token
+generation window with a 12-token overlap.
+
+I trained it on my RTX 3070 Ti to step 55,869. The text looked more like English,
+but the model still did not reliably continue a prompt or answer simple questions.
+The best fully masked continuation loss was 6.65 at step 46,500. Removing Mamba
+did not fix generation.
+
+### V5 — character noise
+
+In a separate run from the earlier MLX self-draft test below, I tried random
+character noise instead of MASK tokens. This CUDA model has
+16 attention layers and about 218 million parameters. It uses a 96-character
+alphabet, a 1,024-character context, a 256-character generation block, a
+192-character overlap, and 32 denoising steps. I converted the same book corpus
+to characters.
+
+I stopped at step 65,450. Full-noise validation loss barely changed: 3.041 at
+step 1,000 and 3.033 at step 65,000, with a best of 3.028 at step 53,000. A
+simple character-frequency baseline gives about 3.038 on those validation
+fragments. Low-noise loss fell from 0.094 to 0.028, but the three fixed prompts
+still produced similar made-up English. The sample script printed only 128
+characters, so those samples did not test the overlap. I kept the best weights
+and stopped the run rather than train through the rest of the corpus.
 
 ## A couple of V1 samples
 
@@ -111,7 +140,7 @@ remove exact duplicate normalized fragments. Older English, poetry, and lists
 still show up, and near-duplicates may remain. Source revisions and checksums
 are saved in `data/v4_books/manifest.json`.
 
-## Running
+## Running V4
 
 I use a local environment with MLX, mlx-recurrence, transformers, NumPy, psutil,
 and Aim. From the project root:
@@ -149,3 +178,22 @@ so I can compare samples over time.
 `prepare_data.py` supports resuming data preparation and also needs
 huggingface-hub and PyArrow. Data, checkpoints, tests, experiments, and old
 version archives stay local and are excluded from Git.
+
+## Later experiments
+
+I also ported V4 to CUDA and trained it on a rented RTX 3090. The run reached
+step 38,475, and I saved a full checkpoint with the optimizer state. Training
+was much faster than on my Mac, but the generated text was still incoherent.
+At step 38,000, the validation loss for a fully masked continuation block was
+about 6.65. Faster hardware let me test the model sooner; it did not solve the
+generation problem by itself.
+
+I then tried V5 as a separate MLX experiment on my Mac, starting from that
+CUDA checkpoint. In V5, some training examples used a continuation drafted by
+the model itself: I masked its lower-confidence tokens again and trained it to
+recover the corresponding book text. By step 39,500, the loss on this draft
+task had improved, but the fully masked continuation loss had not, and the
+fixed-prompt samples became dominated by commas and common function words.
+I stopped at step 39,504 and kept the checkpoints. This experiment did not
+improve free text generation, so I am not treating its lower draft loss as a
+successful result.
